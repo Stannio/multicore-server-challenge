@@ -19,12 +19,12 @@ import (
 //   - the feed returns following = true: every feed row is by an author the viewer follows, in the same snapshot.
 const (
 	articleRow  = `a.id, a.slug, a.title, a.description, ` + articleRest
-	articleRest = `a.created_at, a.updated_at,
-       ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at
-              WHERE at.article_id = a.id ORDER BY 1) AS tag_list,
+	articleRest = `a.created_at, a.updated_at, ` + tagList + `,
        (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) AS favorites_count,
        EXISTS (SELECT 1 FROM favorites f WHERE f.article_id = a.id AND f.user_id = $1) AS favorited,
        u.username, u.bio, u.image,`
+	tagList = `ARRAY(SELECT (SELECT t.name FROM tags t WHERE t.id = at.tag_id) FROM article_tags at
+              WHERE at.article_id = a.id ORDER BY 1) AS tag_list`
 	following = `
        EXISTS (SELECT 1 FROM follows fo WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id) AS following`
 	fromArticles = `
@@ -55,12 +55,17 @@ const (
 	articleBySlug = articleFullSelect + ` WHERE a.slug = $2`
 	articleByID   = articleFullSelect + ` WHERE a.id = $2`
 
+	// POST /api/articles: SPEC's transaction, statement for statement and in its order (so article ids are consumed
+	// exactly as SPEC's SQL does, even when the transaction fails), sent as one pgx batch: one round trip, one
+	// implicit transaction committed at its Sync. The later statements find the new id with currval, which is
+	// session-local and set by insertArticle's nextval.
 	insertArticle = `INSERT INTO articles (id, slug, author_id, title, description, body)
 SELECT n.id, trim(both '-' from lower(regexp_replace($2, '[^A-Za-z0-9]+', '-', 'g'))) || '-' || n.id, $1, $2, $3, $4
-  FROM (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id) n
-RETURNING id`
+  FROM (SELECT nextval(pg_get_serial_sequence('articles', 'id')) AS id) n`
+	newArticleID      = `(SELECT currval(pg_get_serial_sequence('articles', 'id')))` // an InitPlan, so a.id = ... can use the index
 	insertTags        = `INSERT INTO tags (name) SELECT DISTINCT unnest($1::text[]) ON CONFLICT (name) DO NOTHING`
-	insertArticleTags = `INSERT INTO article_tags (article_id, tag_id) SELECT $1, t.id FROM tags t WHERE t.name = ANY($2::text[])`
+	insertArticleTags = `INSERT INTO article_tags (article_id, tag_id) SELECT ` + newArticleID + `, t.id FROM tags t WHERE t.name = ANY($1::text[])`
+	newArticle        = articleFullSelect + ` WHERE a.id = ` + newArticleID
 
 	updateArticle = `UPDATE articles SET title = COALESCE($2, title), description = COALESCE($3, description), body = COALESCE($4, body),
        slug = CASE WHEN $2::text IS NULL THEN slug ELSE trim(both '-' from lower(regexp_replace($2, '[^A-Za-z0-9]+', '-', 'g'))) || '-' || id END,
@@ -234,33 +239,37 @@ func (a *app) createArticle(w http.ResponseWriter, r *http.Request, viewer int64
 		}
 	}
 
-	ctx := r.Context()
-	tx, err := a.pool.Begin(ctx)
+	b := &pgx.Batch{}
+	b.Queue(insertArticle, viewer, title, description, body)
+	if len(tagList) > 0 {
+		b.Queue(insertTags, tagList)
+		b.Queue(insertArticleTags, tagList)
+	}
+	b.Queue(newArticle, viewer)
+	br := a.pool.SendBatch(r.Context(), b)
+	defer br.Close()
+	for i := 1; i < b.Len(); i++ {
+		if _, err := br.Exec(); err != nil {
+			internalError(w, err)
+			return
+		}
+	}
+	rows, _ := br.Query()
+	x, err := pgx.CollectExactlyOneRow(rows, scanFullArticle)
 	if err != nil {
 		internalError(w, err)
 		return
 	}
-	defer tx.Rollback(ctx)
-	var id int64
-	if err := tx.QueryRow(ctx, insertArticle, viewer, title, description, body).Scan(&id); err != nil {
+	// Close reads through ReadyForQuery, i.e. the commit: only then is the article durable (rule 6).
+	if err := br.Close(); err != nil {
 		internalError(w, err)
 		return
 	}
-	if len(tagList) > 0 {
-		if _, err := tx.Exec(ctx, insertTags, tagList); err != nil {
-			internalError(w, err)
-			return
-		}
-		if _, err := tx.Exec(ctx, insertArticleTags, id, tagList); err != nil {
-			internalError(w, err)
-			return
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		internalError(w, err)
-		return
-	}
-	a.writeFullArticle(w, r, http.StatusCreated, articleByID, viewer, id)
+	o := newOut()
+	o.b = append(o.b, `{"article":`...)
+	o.b = appendArticle(o.b, &x)
+	o.b = append(o.b, '}')
+	o.send(w, http.StatusCreated)
 }
 
 // ownArticle looks up the article by slug: 404 if missing, 403 if the viewer isn't its author.
@@ -320,38 +329,35 @@ func (a *app) deleteArticle(w http.ResponseWriter, r *http.Request, viewer int64
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// articleID: SELECT id FROM articles WHERE slug = $1 → 404.
-func (a *app) articleID(w http.ResponseWriter, r *http.Request) (int64, bool) {
-	var id int64
-	err := a.pool.QueryRow(r.Context(), `SELECT id FROM articles WHERE slug = $1`, r.PathValue("slug")).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		writeError(w, http.StatusNotFound, "article not found")
-		return 0, false
-	}
-	if err != nil {
-		internalError(w, err)
-		return 0, false
-	}
-	return id, true
-}
+// Favorite and unfavorite: SPEC's slug lookup, write and re-read as one statement. A data-modifying CTE's rows are
+// invisible to its own statement, so the count adds (subtracts) the row just written and favorited is the constant
+// the re-read would return. No row means no such article (404), and then nothing was written.
+const (
+	favoriteArticle = `WITH w AS (
+  INSERT INTO favorites (user_id, article_id) SELECT $1::bigint, a.id FROM articles a WHERE a.slug = $2
+  ON CONFLICT DO NOTHING RETURNING 1)
+SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, ` + tagList + `,
+       (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) + (SELECT count(*) FROM w) AS favorites_count,
+       true AS favorited,
+       u.username, u.bio, u.image,` + following + fromArticles + `
+ WHERE a.slug = $2`
+	unfavoriteArticle = `WITH w AS (
+  DELETE FROM favorites f USING articles a WHERE a.slug = $2 AND f.article_id = a.id AND f.user_id = $1::bigint
+  RETURNING 1)
+SELECT a.id, a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, ` + tagList + `,
+       (SELECT count(*) FROM favorites f WHERE f.article_id = a.id) - (SELECT count(*) FROM w) AS favorites_count,
+       false AS favorited,
+       u.username, u.bio, u.image,` + following + fromArticles + `
+ WHERE a.slug = $2`
+)
 
 // POST and DELETE /api/articles/{slug}/favorite
 func (a *app) favorite(fav bool) authed {
+	query := unfavoriteArticle
+	if fav {
+		query = favoriteArticle
+	}
 	return func(w http.ResponseWriter, r *http.Request, viewer int64, _ string) {
-		id, ok := a.articleID(w, r)
-		if !ok {
-			return
-		}
-		var err error
-		if fav {
-			_, err = a.pool.Exec(r.Context(), `INSERT INTO favorites (user_id, article_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, viewer, id)
-		} else {
-			_, err = a.pool.Exec(r.Context(), `DELETE FROM favorites WHERE user_id = $1 AND article_id = $2`, viewer, id)
-		}
-		if err != nil {
-			internalError(w, err)
-			return
-		}
-		a.writeFullArticle(w, r, http.StatusOK, articleByID, viewer, id)
+		a.writeFullArticle(w, r, http.StatusOK, query, viewer, r.PathValue("slug"))
 	}
 }

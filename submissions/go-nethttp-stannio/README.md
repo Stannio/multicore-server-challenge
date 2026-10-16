@@ -28,6 +28,12 @@ SPEC's SQL):
 - **One round trip per request**: lists send page + count as one pgx batch; comments run SPEC's slug lookup and
   comments query as one statement (no row = 404, one NULL row = no comments). The feed returns
   `following = true` (every feed row is by a followee).
+- **Writes in one statement**: favorite/unfavorite, comment create and follow/unfollow fold SPEC's lookup, write
+  and re-read into one statement with a data-modifying CTE (a CTE's own writes are invisible to its statement, so
+  favoritesCount adds or subtracts the row just written). Article create sends SPEC's four statements, in SPEC's
+  order, as one pgx batch: one implicit transaction, and the response waits for its commit.
+- Pool: 10 connections per core. Smaller pools (24) throttle throughput, since without pipelining every
+  connection idles through each round trip; 40 was no better than 80.
 
 Go:
 

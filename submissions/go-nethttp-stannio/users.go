@@ -196,25 +196,24 @@ func (a *app) getProfile(w http.ResponseWriter, r *http.Request, viewer int64, _
 	writeProfile(w, &p)
 }
 
-// POST and DELETE /api/profiles/{username}/follow
+// POST and DELETE /api/profiles/{username}/follow: SPEC's user lookup and write as one statement (a data-modifying
+// CTE always runs). No row means no such user (404), and then nothing was written.
 func (a *app) follow(follow bool) authed {
+	query := `WITH u AS (SELECT id, username, bio, image FROM users WHERE username = $2),
+     w AS (DELETE FROM follows f USING u WHERE f.follower_id = $1::bigint AND f.followee_id = u.id)
+SELECT id, username, bio, image FROM u`
+	if follow {
+		query = `WITH u AS (SELECT id, username, bio, image FROM users WHERE username = $2),
+     w AS (INSERT INTO follows (follower_id, followee_id) SELECT $1::bigint, u.id FROM u ON CONFLICT DO NOTHING)
+SELECT id, username, bio, image FROM u`
+	}
 	return func(w http.ResponseWriter, r *http.Request, viewer int64, _ string) {
 		var id int64
 		var p profileJSON
-		err := a.pool.QueryRow(r.Context(), `SELECT id, username, bio, image FROM users WHERE username = $1`,
-			r.PathValue("username")).Scan(&id, &p.Username, &p.Bio, &p.Image)
+		err := a.pool.QueryRow(r.Context(), query, viewer, r.PathValue("username")).Scan(&id, &p.Username, &p.Bio, &p.Image)
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "profile not found")
 			return
-		}
-		if err != nil {
-			internalError(w, err)
-			return
-		}
-		if follow {
-			_, err = a.pool.Exec(r.Context(), `INSERT INTO follows (follower_id, followee_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, viewer, id)
-		} else {
-			_, err = a.pool.Exec(r.Context(), `DELETE FROM follows WHERE follower_id = $1 AND followee_id = $2`, viewer, id)
 		}
 		if err != nil {
 			internalError(w, err)

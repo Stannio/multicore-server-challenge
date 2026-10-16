@@ -73,15 +73,17 @@ func (a *app) createComment(w http.ResponseWriter, r *http.Request, viewer int64
 		writeError(w, http.StatusUnprocessableEntity, "body is required")
 		return
 	}
-	id, ok := a.articleID(w, r)
-	if !ok {
-		return
-	}
+	// SPEC's slug lookup and insert as one statement: no row means no such article (404), and nothing was written.
 	var c commentJSON
-	err = a.pool.QueryRow(r.Context(), `WITH c AS (INSERT INTO comments (article_id, author_id, body) VALUES ($1, $2, $3)
+	err = a.pool.QueryRow(r.Context(), `WITH c AS (INSERT INTO comments (article_id, author_id, body)
+           SELECT a.id, $2::bigint, $3::text FROM articles a WHERE a.slug = $1
            RETURNING id, body, created_at, updated_at, author_id)
 SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image
-  FROM c JOIN users u ON u.id = c.author_id`, id, viewer, body).Scan(&c.ID, &c.Body, &c.CreatedAt, &c.UpdatedAt, &c.Author.Username, &c.Author.Bio, &c.Author.Image)
+  FROM c JOIN users u ON u.id = c.author_id`, r.PathValue("slug"), viewer, body).Scan(&c.ID, &c.Body, &c.CreatedAt, &c.UpdatedAt, &c.Author.Username, &c.Author.Bio, &c.Author.Image)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "article not found")
+		return
+	}
 	if err != nil {
 		internalError(w, err)
 		return
